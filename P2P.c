@@ -28,10 +28,12 @@ void* sending_peer_thread_handler(void* argv) {
 	pthread_exit(NULL);
 }
 
-void* receiving_thread_handler(void* argv) {
-	int client_sock = *((int*)argv);
+void* receiving_peer_thread_handler(void* argv) {
+	struct addr_index receiving_peer_addr_index = *((struct addr_index*)argv);
 	
-	printf("client sock : %d\n", client_sock);
+	printf("receiving peer IP : %s\n", inet_ntoa(receiving_peer_addr_index.addr.sin_addr));
+	printf("receiving peer port : %d\n", ntohs(receiving_peer_addr_index.addr.sin_port));
+	printf("receiving peer index : %d\n", receiving_peer_addr_index.index);
 	
 	pthread_exit(NULL);
 }
@@ -123,7 +125,7 @@ int main(int argc, char* argv[]) {
 			exit(-1);
 		}
 		
-		// 사용중인 IP, 포트 표시
+		// bind된 IP, 포트 표시
 		getsockname(server_sock, (struct sockaddr*) &server_addr, &server_addr_size);
 		printf("Usage port : %d\n", ntohs(server_addr.sin_port));
 		
@@ -231,7 +233,6 @@ int main(int argc, char* argv[]) {
 		}
 		
 		/* receiving_peer_num, file_name, segment_size 수신 */
-		
 		// receiving_peer_num 수신
 		read(sock, &receiving_peer_num, sizeof(receiving_peer_num));
 		printf("receiving_peer_num : %ld\n", receiving_peer_num);
@@ -263,13 +264,35 @@ int main(int argc, char* argv[]) {
 			received_size += read_size;
 		}
 		
+		/* 각 receiving peer와 통신할 thread 생성 및 각 receiving peer와 connect */
+		// my_addr에 자신의 socket이 bind된 주소 저장
+		struct sockaddr_in my_addr;
+		socklen_t my_addr_size = sizeof(my_addr);
+		getsockname(sock, (struct sockaddr*) &my_addr, &my_addr_size);
+		printf("my_addr IP : %s\n", inet_ntoa(my_addr.sin_addr));
+		printf("my_addr port : %d\n\n", ntohs(my_addr.sin_port));
+		
+		// 자신의 index
+		int my_index = 0;
+		
+		// thread 생성
+		pthread_t thread_id[receiving_peer_num - 1];
 		for (int i = 0; i < receiving_peer_num; i ++) {
-			printf("%d receiving peer\n", i);
-			printf("-------------\n");
 			
-			printf("IP : %s\n", inet_ntoa(receiving_peer_addr_index_arr[i].addr.sin_addr));
-			printf("port : %d\n", htons(receiving_peer_addr_index_arr[i].addr.sin_port));
-			printf("index : %d\n", receiving_peer_addr_index_arr[i].index);
+			// 자신의 socket이 bind된 주소일 경우는 제외하고 thread 생성
+			if ((receiving_peer_addr_index_arr[i].addr.sin_addr.s_addr != my_addr.sin_addr.s_addr) || (receiving_peer_addr_index_arr[i].addr.sin_port != my_addr.sin_port)) {
+				
+				pthread_create(&thread_id[i], NULL, receiving_peer_thread_handler, (void*) &receiving_peer_addr_index_arr[i]);
+			}
+			
+			// 자신의 index 저장
+			else {
+				my_index = receiving_peer_addr_index_arr[i].index;
+			}
+		}
+		
+		while(true) {
+			
 		}
 	}
 	

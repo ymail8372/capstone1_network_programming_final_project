@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <sys/time.h>
 
 #define FILE_NAME_SIZE 516
 #define IP_ADDR "203.252.112.31"
@@ -12,12 +13,17 @@
 /* receiving peer에서 사용하는 전역 변수 */
 size_t receiving_peer_num = 0;
 char file_name[FILE_NAME_SIZE] = "";
+size_t file_size = 0;
 size_t segment_size = 0;
 int my_index = 0;
 
 /* mutex */
 pthread_mutex_t sending_peer_mutex;
 pthread_mutex_t receiving_peer_mutex;
+
+/* 코드 실행 시간 측정을 위한 전역 변수 */
+struct timeval tv;
+double start, end;
 
 // addr_index struct 선언
 struct addr_index {
@@ -35,6 +41,7 @@ struct receiving_peer_connection_thread_arg {
 struct sending_peer_data_thread_arg {
 	int index;
 	int sock;
+	size_t* progress_size_list;
 };
 
 // receiving_peer_data_thread에 전송할 구조체 선언
@@ -42,7 +49,72 @@ struct receiving_peer_data_thread_arg {
 	int index;
 	int sock;
 	char* index_file_name;
+	size_t* progress_size_list;
 };
+
+void progress_bar_sending_peer(size_t* progress_size_list) {
+	size_t received_size = 0;
+	gettimeofday(&tv, NULL);
+	end = tv.tv_sec*1000 + tv.tv_usec/1000;
+	
+	// 화면 초기화
+	system("clear");
+	
+	// received_size 구하기
+	for(int i = 0; i < receiving_peer_num; i ++) {
+		received_size += progress_size_list[i];
+	}
+	
+	if ((end - start) / 1000 != 0) {
+		printf("Sending Peer [");
+		for (int i = 0; i < (float)received_size / (float)file_size * 20; i ++) {
+			printf("#");
+		}
+		for (int i = (float)received_size / (float)file_size * 20; i < 20; i ++) {
+			printf(" ");
+		}
+		printf("] %ld%% (%ld / %ld) %.2lfMbps\n", (size_t) ((float)received_size / (float)file_size * 100), received_size, file_size, ((float)received_size / ((end - start) / 1000)) / (1024*1024));
+		
+		for (int i = 0; i < receiving_peer_num; i ++) {
+			printf("To Receiving Peer #%d : %.2lfMbps\n", i, ((float)progress_size_list[i] / ((end - start) / 1000)) / (1024*1024));
+		}
+	}
+	
+}
+
+void progress_bar_receiving_peer(size_t* progress_size_list) {
+	size_t received_size = 0;
+	gettimeofday(&tv, NULL);
+	end = tv.tv_sec*1000 + tv.tv_usec/1000;
+	
+	// 화면 초기화
+	system("clear");
+	
+	// received_size 구하기
+	for(int i = 0; i < receiving_peer_num; i ++) {
+		received_size += progress_size_list[i];
+	}
+	
+	if ((end - start) / 1000 != 0) {
+		printf("Receiving Peer #%d [", my_index);
+		for (int i = 0; i < (float)received_size / (float)file_size * 20; i ++) {
+			printf("#");
+		}
+		for (int i = (float)received_size / (float)file_size * 20; i < 20; i ++) {
+			printf(" ");
+		}
+		printf("] %ld%% (%ld / %ld) %.2lfMbps\n", (size_t) ((float)received_size / (float)file_size * 100), received_size, file_size, ((float)received_size / ((end - start) / 1000)) / (1024*1024));
+		
+		for (int i = 0; i < receiving_peer_num; i ++) {
+			if (i != my_index) {
+				printf("From Receiving Peer #%d : %.2lfMbps\n", i, ((float)progress_size_list[i] / ((end - start) / 1000)) / (1024*1024));
+			}
+			else {
+				printf("From Sending Peer #%d : %.2lfMbps\n", i, ((float)progress_size_list[i] / ((end - start) / 1000)) / (1024*1024));
+			}
+		}
+	}
+}
 
 // sending_peer_data_thread가 모두 끝났는지 확인하기 위한 용도
 int sending_peer_data_thread_end_counter = 0;
@@ -50,15 +122,13 @@ int sending_peer_data_thread_end_counter = 0;
 void* sending_peer_data_thread_handler(void* arg) {
 	int receiving_peer_index = ((struct sending_peer_data_thread_arg*)arg)->index;
 	int receiving_peer_sock = ((struct sending_peer_data_thread_arg*)arg)->sock;
+	size_t* progress_size_list = ((struct sending_peer_data_thread_arg*)arg)->progress_size_list;
 	
 	/* receiving peer의 index에 맞는 file의 부분을 읽어서 전송 */
 	FILE* fp = fopen(file_name, "rb");
 	char buffer[segment_size];
-	size_t file_size = 0, current_location = 0;
+	size_t current_location = 0, total_received_size = 0;
 	
-	// file_size 구하기
-	fseek(fp, 0, SEEK_END);
-	file_size = ftell(fp);
 	fseek(fp, 0, SEEK_SET);
 	
 	while(true) {
@@ -80,12 +150,23 @@ void* sending_peer_data_thread_handler(void* arg) {
 		// file 읽기
 		read_size = fread(buffer, 1, segment_size, fp);
 		current_location += read_size;
+		
+		// progress_size_list 업데이트
+		total_received_size += read_size;
+		progress_size_list[receiving_peer_index] = total_received_size;
 	
 		// read_size 전송
 		write(receiving_peer_sock, &read_size, sizeof(read_size));
 		
 		// file 전송
 		write(receiving_peer_sock, buffer, read_size);
+		
+		usleep(100000);
+		
+		// progress_bar 표현
+		if (receiving_peer_index == 0) {
+			progress_bar_sending_peer(progress_size_list);
+		}
 		
 		// 다음 전송에서 알맞는 receiving peer의 index에 맞는 위치로 fp를 이동시키기 위해 미리 fp 이동
 		fseek(fp, segment_size * ((receiving_peer_num - 1) - receiving_peer_index), SEEK_CUR);
@@ -136,10 +217,12 @@ void* receiving_peer_data_thread_handler(void* arg) {
 	int receiving_peer_index = ((struct receiving_peer_data_thread_arg*)arg)->index;
 	int receiving_peer_sock = ((struct receiving_peer_data_thread_arg*)arg)->sock;
 	char* index_file_name = ((struct receiving_peer_data_thread_arg*)arg)->index_file_name;
+	size_t* progress_size_list = ((struct receiving_peer_data_thread_arg*)arg)->progress_size_list;
 	
 	/* receiving peer로부터 data 받아서 파일에 쓰기 */
 	FILE* fp = fopen(index_file_name, "wb");
 	char buffer[segment_size];
+	size_t total_received_size = 0;
 	
 	while(true) {
 		size_t total_size = 0, received_size = 0, read_size = 0;
@@ -154,6 +237,12 @@ void* receiving_peer_data_thread_handler(void* arg) {
 		while(received_size < total_size) {
 			read_size = read(receiving_peer_sock, &buffer[received_size], total_size - received_size);
 			received_size += read_size;
+		}
+		total_received_size += received_size;
+		progress_size_list[receiving_peer_index] = total_received_size;
+		
+		if (receiving_peer_index == 0) {
+			progress_bar_receiving_peer(progress_size_list);
 		}
 		
 		// end_signal을 수신한 경우
@@ -270,7 +359,7 @@ int main(int argc, char* argv[]) {
 			exit(-1);
 		}
 		
-		/* accept()된 receiving peer에게 listeing_addr 수신받고 receiving_peer_num, file_name, segment_size, my_index 전송 */
+		/* accept()된 receiving peer에게 listeing_addr 수신받고 receiving_peer_num, file_name, file_size, segment_size, my_index 전송 */
 		struct addr_index receiving_peer_addr_index_arr[receiving_peer_num];
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			
@@ -296,6 +385,13 @@ int main(int argc, char* argv[]) {
 			
 			// file_name 전송
 			write(receiving_peer_socks[i], file_name, file_name_size);
+			
+			// file_size 전송
+			FILE* fp = fopen(file_name, "rb");
+			fseek(fp, 0, SEEK_END);
+			file_size = ftell(fp);
+			fclose(fp);
+			write(receiving_peer_socks[i], &file_size, sizeof(file_size));
 			
 			// segment_size 전송
 			write(receiving_peer_socks[i], &segment_size, sizeof(segment_size));
@@ -325,10 +421,19 @@ int main(int argc, char* argv[]) {
 		pthread_t sending_thread_id[receiving_peer_num];
 		pthread_mutex_init(&sending_peer_mutex, NULL);
 		
+		// sending_peer의 progress bar를 위해 각 thread별로 전송한 size를 저장하기 위한 배열
+		size_t* progress_size_list = (size_t*) malloc(sizeof(size_t) * receiving_peer_num);
+		memset(progress_size_list, 0, sizeof(size_t) * receiving_peer_num);
+		
+		// 코드 실행 시간 측정 timer on
+		gettimeofday(&tv, NULL);
+		start = tv.tv_sec*1000 + tv.tv_usec/1000;
+		
 		struct sending_peer_data_thread_arg arg[receiving_peer_num];
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			arg[i].index = i;
 			arg[i].sock = receiving_peer_socks[i];
+			arg[i].progress_size_list = progress_size_list;
 			
 			pthread_create(&sending_thread_id[i], NULL, sending_peer_data_thread_handler, (void*) &arg[i]);
 			pthread_detach(sending_thread_id[i]);
@@ -341,6 +446,7 @@ int main(int argc, char* argv[]) {
 			}
 		}
 		
+		free(progress_size_list);
 		pthread_mutex_destroy(&sending_peer_mutex);
 	}
 	
@@ -428,7 +534,7 @@ int main(int argc, char* argv[]) {
 		// sending peer에게 listening_addr 전달
 		write(sending_peer_sock, &listening_addr, sizeof(listening_addr));
 		
-		/* receiving_peer_num, file_name, segment_size, my_index 수신 */
+		/* receiving_peer_num, file_name, file_size, segment_size, my_index 수신 */
 		// receiving_peer_num 수신
 		read(sending_peer_sock, &receiving_peer_num, sizeof(receiving_peer_num));
 		
@@ -442,6 +548,8 @@ int main(int argc, char* argv[]) {
 			read_size = read(sending_peer_sock, &file_name[received_size], file_name_size - received_size);
 			received_size += read_size;
 		}
+		
+		read(sending_peer_sock, &file_size, sizeof(file_size));
 		
 		// segment_size 수신
 		read(sending_peer_sock, &segment_size, sizeof(segment_size));
@@ -514,13 +622,6 @@ int main(int argc, char* argv[]) {
 			pthread_join(connection_thread_ids[i], NULL);
 		}
 		
-		///* receiving_peer_socks의 output_buffer_size 업데이트 */
-		//for (int i = 0; i < receiving_peer_num; i ++) {
-		//	if (receiving_peer_socks[i] != 0) {
-		//		setsockopt(receiving_peer_socks[i], SOL_SOCKET, SO_SNDBUF, (void*) &output_buffer_size, sizeof(output_buffer_size));
-		//	}
-		//}
-		
 		/* sending peer에게 연결 완료 전송 */
 		bool connection_complete = true;
 		write(sending_peer_sock, &connection_complete, sizeof(connection_complete));
@@ -553,6 +654,14 @@ int main(int argc, char* argv[]) {
 		
 		pthread_mutex_init(&receiving_peer_mutex, NULL);
 		
+		// sending_peer의 progress bar를 위해 각 thread별로 전송한 size를 저장하기 위한 배열
+		size_t* progress_size_list = (size_t*) malloc(sizeof(size_t) * receiving_peer_num);
+		memset(progress_size_list, 0, sizeof(size_t) * receiving_peer_num);
+		
+		// 코드 실행 시간 측정 timer on
+		gettimeofday(&tv, NULL);
+		start = tv.tv_sec*1000 + tv.tv_usec/1000;
+		
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			
 			// my_index가 아닌 경우
@@ -561,6 +670,7 @@ int main(int argc, char* argv[]) {
 				data_arg[i].index = i;
 				data_arg[i].sock = receiving_peer_socks[i];
 				data_arg[i].index_file_name = file_name_list[i];
+				data_arg[i].progress_size_list = progress_size_list;
 				
 				// receiving_peer_data_thread 생성
 				pthread_create(&data_thread_ids[i], NULL, receiving_peer_data_thread_handler, (void*) &data_arg[i]);
@@ -571,6 +681,7 @@ int main(int argc, char* argv[]) {
 		/* sending peer로부터 my_index에 해당하는 데이터 받기 + echo */
 		FILE* fp = fopen(file_name_list[my_index], "wb");
 		char buffer[segment_size];
+		size_t total_received_size = 0;
 		
 		while(true) {
 			size_t total_size = 0, received_size = 0, read_size = 0;
@@ -608,6 +719,8 @@ int main(int argc, char* argv[]) {
 				read_size = read(sending_peer_sock, &buffer[received_size], total_size - received_size);
 				received_size += read_size;
 			}
+			total_received_size += received_size;
+			progress_size_list[my_index] = total_received_size;
 			
 			// receiving peer들에게 echo
 			for(int i = 0; i < receiving_peer_num; i ++) {
@@ -690,6 +803,7 @@ int main(int argc, char* argv[]) {
 		
 		fclose(original_fp);
 		free(receiving_peer_socks);
+		free(progress_size_list);
 	}
 	
 	return 0;

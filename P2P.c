@@ -7,13 +7,17 @@
 #include <pthread.h>
 
 #define FILE_NAME_SIZE 516
+#define IP_ADDR "203.252.112.31"
 
 /* receiving peer에서 사용하는 전역 변수 */
 size_t receiving_peer_num = 0;
 char file_name[FILE_NAME_SIZE] = "";
 size_t segment_size = 0;
 int my_index = 0;
-size_t output_buffer_size = 0;
+
+/* mutex */
+pthread_mutex_t sending_peer_mutex;
+pthread_mutex_t receiving_peer_mutex;
 
 // addr_index struct 선언
 struct addr_index {
@@ -37,7 +41,7 @@ struct sending_peer_data_thread_arg {
 struct receiving_peer_data_thread_arg {
 	int index;
 	int sock;
-	char* file_name_index;
+	char* index_file_name;
 };
 
 // sending_peer_data_thread가 모두 끝났는지 확인하기 위한 용도
@@ -50,52 +54,47 @@ void* sending_peer_data_thread_handler(void* arg) {
 	/* receiving peer의 index에 맞는 file의 부분을 읽어서 전송 */
 	FILE* fp = fopen(file_name, "rb");
 	char buffer[segment_size];
-	int file_size = 0, current_location = 0;
+	size_t file_size = 0, current_location = 0;
 	
 	// file_size 구하기
 	fseek(fp, 0, SEEK_END);
 	file_size = ftell(fp);
-	
-	fclose(fp);
-	fp = fopen(file_name, "rb");
+	fseek(fp, 0, SEEK_SET);
 	
 	while(true) {
 		size_t read_size = 0;
 		
 		// buffer 초기화
-		for(int i = 0; i < segment_size; i ++) {
-			buffer[i] = 0;
-		}
+		memset(buffer, 0, segment_size);
 		
 		// receiving peer의 index에 맞는 위치로 fp 이동
 		fseek(fp, segment_size * receiving_peer_index, SEEK_CUR);
 		current_location += segment_size * receiving_peer_index;
 		
 		if (current_location > file_size) {
+			fclose(fp);
+			close(receiving_peer_sock);
 			break;
 		}
-		
+	
 		// file 읽기
 		read_size = fread(buffer, 1, segment_size, fp);
 		current_location += read_size;
-		
-		//sleep(1);
-		
+	
 		// read_size 전송
 		write(receiving_peer_sock, &read_size, sizeof(read_size));
 		
 		// file 전송
 		write(receiving_peer_sock, buffer, read_size);
 		
-		// 다음 전송에서 알맞는 receiving peer의 index에 맞는 위치로 fp를 이동시키기 위해 fp 초기화 이동
+		// 다음 전송에서 알맞는 receiving peer의 index에 맞는 위치로 fp를 이동시키기 위해 미리 fp 이동
 		fseek(fp, segment_size * ((receiving_peer_num - 1) - receiving_peer_index), SEEK_CUR);
 		current_location += segment_size * ((receiving_peer_num - 1) - receiving_peer_index);
 	}
 	
-	fclose(fp);
-	close(receiving_peer_sock);
-	
+	pthread_mutex_lock(&sending_peer_mutex);
 	sending_peer_data_thread_end_counter += 1;
+	pthread_mutex_unlock(&sending_peer_mutex);
 	
 	pthread_exit(NULL);
 }
@@ -108,9 +107,9 @@ void* receiving_peer_connection_thread_handler(void* arg) {
 	int sock;
 	struct sockaddr_in addr;
 	socklen_t addr_size = sizeof(addr);
-	
+
 	// socket()
-	sock = socket(AF_INET, SOCK_STREAM, 0);
+	sock = socket(PF_INET, SOCK_STREAM, 0);
 	if (sock == -1) {
 		printf("[Error] socket() in thread\n");
 		exit(-1);
@@ -136,36 +135,36 @@ int receiving_peer_data_thread_end_count = 0;
 void* receiving_peer_data_thread_handler(void* arg) {
 	int receiving_peer_index = ((struct receiving_peer_data_thread_arg*)arg)->index;
 	int receiving_peer_sock = ((struct receiving_peer_data_thread_arg*)arg)->sock;
-	char* file_name_index = ((struct receiving_peer_data_thread_arg*)arg)->file_name_index;
+	char* index_file_name = ((struct receiving_peer_data_thread_arg*)arg)->index_file_name;
 	
 	/* receiving peer로부터 data 받아서 파일에 쓰기 */
-	FILE* fp = fopen(file_name_index, "wb");
+	FILE* fp = fopen(index_file_name, "wb");
 	char buffer[segment_size];
 	
 	while(true) {
 		size_t total_size = 0, received_size = 0, read_size = 0;
 		
 		// buffer 초기화
-		for(int i = 0; i < segment_size; i ++) {
-			buffer[i] = 0;
-		}
+		memset(buffer, 0, segment_size);
 		
 		// receiving_peer으로부터 파일 크기 수신
 		read_size = read(receiving_peer_sock, &total_size, sizeof(total_size));
 		
 		// receiving_peer으로부터 파일 수신
 		while(received_size < total_size) {
-			read_size = read(receiving_peer_sock, buffer, total_size - received_size);
+			read_size = read(receiving_peer_sock, &buffer[received_size], total_size - received_size);
 			received_size += read_size;
 		}
-		//printf("[%d] received_size : %ld\n", receiving_peer_index, received_size);
 		
 		// end_signal을 수신한 경우
 		if (strcmp(buffer, "^&*No More Data*&^") == 0) {
 			fclose(fp);
 			
 			// receiving_peer_data_thread_end_count 업데이트
+			
+			pthread_mutex_lock(&receiving_peer_mutex);
 			receiving_peer_data_thread_end_count += 1;
+			pthread_mutex_unlock(&receiving_peer_mutex);
 			
 			pthread_exit(NULL);
 		}
@@ -177,7 +176,7 @@ void* receiving_peer_data_thread_handler(void* arg) {
 
 int main(int argc, char* argv[]) {
     extern char *optarg;
-    extern int optind; 
+    extern int optind;
 	int option = 0;
 	
 	/* option 받기 */
@@ -232,18 +231,18 @@ int main(int argc, char* argv[]) {
 					}
 					segment_size = atoi(optarg);
 					segment_size = segment_size * 1024;
-					output_buffer_size = segment_size * 2;
+					//output_buffer_size = segment_size * 2;
 					break;
 			}
 		}
 		
 		/* receiving_peer_num 만큼 connect() 요청 받기 */
-		int listening_sock, receiving_peer_sock[receiving_peer_num];
+		int listening_sock, receiving_peer_socks[receiving_peer_num];
 		struct sockaddr_in server_addr, client_addr;
 		socklen_t server_addr_size = sizeof(server_addr), client_addr_size = sizeof(client_addr);
 		
 		// socket()
-		listening_sock = socket(AF_INET, SOCK_STREAM, 0);
+		listening_sock = socket(PF_INET, SOCK_STREAM, 0);
 		if (listening_sock == -1) {
 			printf("[Error] socket()\n");
 			exit(-1);
@@ -252,7 +251,7 @@ int main(int argc, char* argv[]) {
 		// server_addr 세팅
 		memset(&server_addr, 0, sizeof(server_addr));
 		server_addr.sin_family = AF_INET;
-		server_addr.sin_addr.s_addr = inet_addr("203.252.112.31");
+		server_addr.sin_addr.s_addr = inet_addr(IP_ADDR);
 		server_addr.sin_port = htons(0);
 		
 		// bind()
@@ -276,32 +275,33 @@ int main(int argc, char* argv[]) {
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			
 			// accept()
-			receiving_peer_sock[i] = accept(listening_sock, (struct sockaddr*) &client_addr, &client_addr_size);
-			if (receiving_peer_sock[i] == -1) {
+			receiving_peer_socks[i] = accept(listening_sock, (struct sockaddr*) &client_addr, &client_addr_size);
+			if (receiving_peer_socks[i] == -1) {
 				printf("[Error] accept()\n");
 				exit(-1);
 			}
 			
-			// output_buffer_size 설정
-			setsockopt(listening_sock, SOL_SOCKET, SO_SNDBUF, (void*) &output_buffer_size, sizeof(output_buffer_size));
+			//// output_buffer_size 설정
+			//setsockopt(listening_sock, SOL_SOCKET, SO_SNDBUF, (void*) &output_buffer_size, sizeof(output_buffer_size));
 			
 			struct sockaddr_in receiving_peer_listening_addr;
-			read(receiving_peer_sock[i], &receiving_peer_listening_addr, sizeof(receiving_peer_listening_addr));
+			read(receiving_peer_socks[i], &receiving_peer_listening_addr, sizeof(receiving_peer_listening_addr));
 			
 			// receiving_peer_num 전송
-			write(receiving_peer_sock[i], &receiving_peer_num, sizeof(receiving_peer_num));
+			write(receiving_peer_socks[i], &receiving_peer_num, sizeof(receiving_peer_num));
 			
 			// file_name 크기 전송
 			size_t file_name_size = strlen(file_name)+1;
-			write(receiving_peer_sock[i], &file_name_size, sizeof(file_name_size));
+			write(receiving_peer_socks[i], &file_name_size, sizeof(file_name_size));
 			
 			// file_name 전송
-			write(receiving_peer_sock[i], file_name, file_name_size);
+			write(receiving_peer_socks[i], file_name, file_name_size);
 			
 			// segment_size 전송
-			write(receiving_peer_sock[i], &segment_size, sizeof(segment_size));
+			write(receiving_peer_socks[i], &segment_size, sizeof(segment_size));
 			
-			write(receiving_peer_sock[i], &i, sizeof(i));
+			// my_index 전송
+			write(receiving_peer_socks[i], &i, sizeof(i));
 			
 			// receiving_peer_addr_index_arr에 client의 index, addr 추가
 			receiving_peer_addr_index_arr[i].index = i;
@@ -312,31 +312,36 @@ int main(int argc, char* argv[]) {
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			
 			// receiving_peer_addr_index_arr 전송
-			write(receiving_peer_sock[i], receiving_peer_addr_index_arr, sizeof(receiving_peer_addr_index_arr));
+			write(receiving_peer_socks[i], receiving_peer_addr_index_arr, sizeof(receiving_peer_addr_index_arr));
 		}
 		
 		/* receiving peer의 connection_complete 수신 */
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			bool connection_complete;
-			read(receiving_peer_sock[i], &connection_complete, sizeof(connection_complete));
+			read(receiving_peer_socks[i], &connection_complete, sizeof(connection_complete));
 		}
 		
 		/* 각 receiving peer와의 통신을 처리하는 thread 생성 */
 		pthread_t sending_thread_id[receiving_peer_num];
+		pthread_mutex_init(&sending_peer_mutex, NULL);
 		
 		struct sending_peer_data_thread_arg arg[receiving_peer_num];
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			arg[i].index = i;
-			arg[i].sock = receiving_peer_sock[i];
+			arg[i].sock = receiving_peer_socks[i];
 			
 			pthread_create(&sending_thread_id[i], NULL, sending_peer_data_thread_handler, (void*) &arg[i]);
+			pthread_detach(sending_thread_id[i]);
 		}
 		
+		/* 모든 sending_peer_data_thread가 끝날 때까지 대기 */
 		while (true) {
 			if (sending_peer_data_thread_end_counter == receiving_peer_num) {
 				break;
 			}
 		}
+		
+		pthread_mutex_destroy(&sending_peer_mutex);
 	}
 	
 	/* receiving peer */
@@ -370,39 +375,39 @@ int main(int argc, char* argv[]) {
 		
 		/* socket 생성 및 sending peer로 connect */
 		int sending_peer_sock;
-		struct sockaddr_in server_addr;
+		struct sockaddr_in sending_peer_addr;
 		
 		// socket()
-		sending_peer_sock = socket(AF_INET, SOCK_STREAM, 0);
+		sending_peer_sock = socket(PF_INET, SOCK_STREAM, 0);
 		if (sending_peer_sock == -1) {
 			printf("[Error] socket()\n");
 			exit(-1);
 		}
 		
-		// server_addr 세팅
-		memset(&server_addr, 0, sizeof(server_addr));
-		server_addr.sin_family = AF_INET;
-		server_addr.sin_addr.s_addr = inet_addr(ip_addr);
-		server_addr.sin_port = htons(port);
+		// sending_peer_addr 세팅
+		memset(&sending_peer_addr, 0, sizeof(sending_peer_addr));
+		sending_peer_addr.sin_family = AF_INET;
+		sending_peer_addr.sin_addr.s_addr = inet_addr(ip_addr);
+		sending_peer_addr.sin_port = htons(port);
 		
 		// connet()
-		if (connect(sending_peer_sock, (struct sockaddr*) &server_addr, sizeof(server_addr)) == -1) {
+		if (connect(sending_peer_sock, (struct sockaddr*) &sending_peer_addr, sizeof(sending_peer_addr)) == -1) {
 			printf("[Error] connect()\n");
 			exit(-1);
 		}
 		
 		/* listening socket 만들고 sending peer에게 전달 */
 		int listening_sock;
-		struct sockaddr_in listening_addr, receiving_peer_addr;
-		socklen_t receiving_peer_addr_size = sizeof(receiving_peer_addr), listening_addr_size = sizeof(listening_addr);
+		struct sockaddr_in listening_addr;
+		socklen_t listening_addr_size = sizeof(listening_addr);
 		
 		// listening_sock 생성
-		listening_sock = socket(AF_INET, SOCK_STREAM, 0);
+		listening_sock = socket(PF_INET, SOCK_STREAM, 0);
 		
 		// listening_addr 설정
 		memset(&listening_addr, 0, sizeof(listening_addr));
 		listening_addr.sin_family = AF_INET;
-		listening_addr.sin_addr.s_addr = inet_addr("203.252.112.31");
+		listening_addr.sin_addr.s_addr = inet_addr(IP_ADDR);
 		listening_addr.sin_port = htons(0);
 		
 		// listening_sock bind()
@@ -423,7 +428,7 @@ int main(int argc, char* argv[]) {
 		// sending peer에게 listening_addr 전달
 		write(sending_peer_sock, &listening_addr, sizeof(listening_addr));
 		
-		/* receiving_peer_num, file_name, segment_size, my_index, my_index 수신 */
+		/* receiving_peer_num, file_name, segment_size, my_index 수신 */
 		// receiving_peer_num 수신
 		read(sending_peer_sock, &receiving_peer_num, sizeof(receiving_peer_num));
 		
@@ -433,27 +438,25 @@ int main(int argc, char* argv[]) {
 		
 		// file_name 수신
 		size_t received_size = 0, read_size = 0;
-		char file_name[FILE_NAME_SIZE] = "";
 		while (received_size < file_name_size) {
-			read_size = read(sending_peer_sock, file_name, file_name_size);
+			read_size = read(sending_peer_sock, &file_name[received_size], file_name_size - received_size);
 			received_size += read_size;
 		}
 		
 		// segment_size 수신
 		read(sending_peer_sock, &segment_size, sizeof(segment_size));
 		
-		// output_buffer_size 설정
-		output_buffer_size = segment_size * 2;
+		//// output_buffer_size 설정
+		//output_buffer_size = segment_size * 2;
 		
 		// my_index 수신
 		read(sending_peer_sock, &my_index, sizeof(my_index));
 		
-		/* receiving peer의 listening addr, index (receiving_peer_addr_index_arr) 수신 */
+		/* 다른 모든 receiving peer의 listening addr, index (receiving_peer_addr_index_arr) 수신 */
 		struct addr_index receiving_peer_addr_index_arr[receiving_peer_num];
-		received_size = 0;
-		read_size = 0;
+		received_size = 0; read_size = 0;
 		while (received_size < sizeof(receiving_peer_addr_index_arr)) {
-			read_size = read(sending_peer_sock, receiving_peer_addr_index_arr, sizeof(receiving_peer_addr_index_arr));
+			read_size = read(sending_peer_sock, &receiving_peer_addr_index_arr[received_size], sizeof(receiving_peer_addr_index_arr) - received_size);
 			received_size += read_size;
 		}
 		
@@ -478,11 +481,13 @@ int main(int argc, char* argv[]) {
 			connection_arg[i - (my_index + 1)].receiving_peer_socks = receiving_peer_socks;
 			
 			// thread 생성
-			pthread_create(&connection_thread_ids[i], NULL, receiving_peer_connection_thread_handler, &connection_arg[i - (my_index + 1)]);
+			pthread_create(&connection_thread_ids[i], NULL, receiving_peer_connection_thread_handler, (void*) &connection_arg[i - (my_index + 1)]);
 		}
 			
 		// my_index 보다 작은 index를 가진 receiving peer의 connect()를 수신
 		size_t connected_receiving_peer = 0;
+		struct sockaddr receiving_peer_addr;
+		socklen_t receiving_peer_addr_size = sizeof(receiving_peer_addr);
 		while(true) {
 			
 			// listening socket이 받아야 하는 connect() 요청을 모두 처리한 경우
@@ -509,12 +514,12 @@ int main(int argc, char* argv[]) {
 			pthread_join(connection_thread_ids[i], NULL);
 		}
 		
-		/* receiving_peer_socks의 output_buffer_size 업데이트 */
-		for (int i = 0; i < receiving_peer_num; i ++) {
-			if (receiving_peer_socks[i] != 0) {
-				setsockopt(receiving_peer_socks[i], SOL_SOCKET, SO_SNDBUF, (void*) &output_buffer_size, sizeof(output_buffer_size));
-			}
-		}
+		///* receiving_peer_socks의 output_buffer_size 업데이트 */
+		//for (int i = 0; i < receiving_peer_num; i ++) {
+		//	if (receiving_peer_socks[i] != 0) {
+		//		setsockopt(receiving_peer_socks[i], SOL_SOCKET, SO_SNDBUF, (void*) &output_buffer_size, sizeof(output_buffer_size));
+		//	}
+		//}
 		
 		/* sending peer에게 연결 완료 전송 */
 		bool connection_complete = true;
@@ -542,9 +547,11 @@ int main(int argc, char* argv[]) {
 			strcpy(file_name_list[i], temp);
 		}
 		
-		/* 각 receiving peer마다 thread 생성 */
+		/* 각 receiving peer마다 receiving peer로부터 데이터를 받을 thread 생성 */
 		struct receiving_peer_data_thread_arg data_arg[receiving_peer_num];
 		pthread_t data_thread_ids[receiving_peer_num];
+		
+		pthread_mutex_init(&receiving_peer_mutex, NULL);
 		
 		for (int i = 0; i < receiving_peer_num; i ++) {
 			
@@ -553,11 +560,7 @@ int main(int argc, char* argv[]) {
 				
 				data_arg[i].index = i;
 				data_arg[i].sock = receiving_peer_socks[i];
-				data_arg[i].file_name_index = file_name_list[i];
-				// my_index일 경우 continue
-				if (receiving_peer_socks[i] == 0) {
-					continue;
-				}
+				data_arg[i].index_file_name = file_name_list[i];
 				
 				// receiving_peer_data_thread 생성
 				pthread_create(&data_thread_ids[i], NULL, receiving_peer_data_thread_handler, (void*) &data_arg[i]);
@@ -565,6 +568,7 @@ int main(int argc, char* argv[]) {
 			}
 		}
 		
+		/* sending peer로부터 my_index에 해당하는 데이터 받기 + echo */
 		FILE* fp = fopen(file_name_list[my_index], "wb");
 		char buffer[segment_size];
 		
@@ -572,11 +576,9 @@ int main(int argc, char* argv[]) {
 			size_t total_size = 0, received_size = 0, read_size = 0;
 			
 			// buffer 초기화
-			for(int i = 0; i < segment_size; i ++) {
-				buffer[i] = 0;
-			}
+			memset(buffer, 0, segment_size);
 			
-			// sending_peer으로부터 파일 크기 수신
+			// sending_peer으로부터 sending_peer가 전송하는 파일 크기 수신
 			read_size = read(sending_peer_sock, &total_size, sizeof(total_size));
 			
 			// sending_peer가 모든 데이터를 전송해서 socket close한 경우
@@ -585,16 +587,16 @@ int main(int argc, char* argv[]) {
 				close(sending_peer_sock);
 				
 				// receiving peer에게 end_signal 전송
-				for(int j = 0; j < receiving_peer_num; j ++) {
-					if (j != my_index) {
+				for(int i = 0; i < receiving_peer_num; i ++) {
+					if (i != my_index) {
 						char end_signal[25] = "^&*No More Data*&^";
 						size_t end_signal_len = strlen(end_signal) + 1;
 						
 						// end_signal의 크기 전송
-						write(receiving_peer_socks[j], &end_signal_len, sizeof(end_signal_len));
+						write(receiving_peer_socks[i], &end_signal_len, sizeof(end_signal_len));
 						
 						// end_signal 전송
-						write(receiving_peer_socks[j], end_signal, end_signal_len);
+						write(receiving_peer_socks[i], end_signal, end_signal_len);
 					}
 				}
 				
@@ -603,23 +605,21 @@ int main(int argc, char* argv[]) {
 			
 			// sending_peer으로부터 파일 data 수신
 			while(received_size < total_size) {
-				read_size = read(sending_peer_sock, buffer, total_size - received_size);
+				read_size = read(sending_peer_sock, &buffer[received_size], total_size - received_size);
 				received_size += read_size;
 			}
 			
 			// receiving peer들에게 echo
 			for(int i = 0; i < receiving_peer_num; i ++) {
 				
-				//sleep(1);
-				
 				// my_index를 제외한 모든 receiving_peer에게 data전송
 				if (receiving_peer_socks[i] != 0) {
 					
 					// 파일 크기 전송
-					write(receiving_peer_socks[i], &total_size, sizeof(total_size));
+					write(receiving_peer_socks[i], &received_size, sizeof(received_size));
 					
 					// 파일 data 전송
-					int temp1 = write(receiving_peer_socks[i], buffer, total_size);
+					write(receiving_peer_socks[i], buffer, received_size);
 				}
 			}
 			
@@ -627,12 +627,19 @@ int main(int argc, char* argv[]) {
 			fwrite(buffer, 1, received_size, fp);
 		}
 		
-		/* 모든 receiving_peer_data_thread가 끝날 때까지 대기 */
+		/* 모든 receiving_peer_data_thread가 끝날 때까지 대기, 모두 끝났다면 socket close */
 		while(true) {
 			if (receiving_peer_data_thread_end_count == receiving_peer_num - 1) {
+				for (int i = 0; i < receiving_peer_num; i ++) {
+					if(receiving_peer_socks[i] != 0) {
+						close(receiving_peer_socks[i]);
+					}
+				}
 				break;
 			}
 		}
+		
+		pthread_mutex_destroy(&receiving_peer_mutex);
 		
 		/* temp 파일 하나로 합치기 */
 		FILE* fp_list[receiving_peer_num];
@@ -651,19 +658,14 @@ int main(int argc, char* argv[]) {
 		
 		FILE* original_fp = fopen(new_file_name, "wb");
 		
-		// temp 파일에서 데이터를 읽어서 original 파일에 쓰기
-		int original_file_write_end_counter = 0;
-		
 		/* temp 파일을 순서대로 하나씩 읽어서 original 파일에 쓰기 */
+		int original_file_write_end_counter = 0;
 		while (original_file_write_end_counter < receiving_peer_num) {
 			
 			for (int i = 0; i < receiving_peer_num; i ++) {
 				
 				// buffer 초기화
-				for (int j = 0; j < segment_size; j ++) {
-					buffer[j] = 0;
-				}
-				
+				memset(buffer, 0, segment_size);
 				
 				// temp 파일로부터 segment_size만큼 데이터를 읽어 buffer에 저장
 				size_t read_size = fread(buffer, 1, segment_size, fp_list[i]);
@@ -682,7 +684,7 @@ int main(int argc, char* argv[]) {
 		}
 		
 		/* tmp파일 삭제 */
-		system("rm *.tmp 2> /dev/null");
+		//system("rm *.tmp 2> /dev/null");
 		
 		printf("COMPLETE\n");
 		
